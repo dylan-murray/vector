@@ -356,21 +356,63 @@ where
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use futures_util::SinkExt;
     use indoc::indoc;
     use serde_json::json;
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
+    use tokio_util::sync::PollSender;
     use vector_lib::{enrichment::TableRegistry, lookup::owned_value_path};
     use vrl::value::Kind;
 
     use super::*;
     use crate::{
-        config::{OutputId, TransformConfig, schema, schema::Definition},
+        config::{
+            ConfigBuilder, OutputId, TransformConfig,
+            schema::{self, Definition},
+            unit_test::{UnitTestStreamSinkConfig, UnitTestStreamSourceConfig},
+        },
         event::{LogEvent, Value},
-        test_util::components::assert_transform_compliance,
-        transforms::test::create_topology,
+        test_util::{components::assert_transform_compliance, start_topology},
+        topology::RunningTopology,
     };
+
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[allow(dead_code)]
+    pub async fn create_topology<T: TransformConfig + 'static>(
+        events: impl Stream<Item = Event> + Send + 'static,
+        transform_config: T,
+        source_name: Option<String>,
+        transform_name: Option<String>,
+        sink_name: Option<String>,
+    ) -> (RunningTopology, mpsc::Receiver<Event>, String, String, String) {
+        let mut builder = ConfigBuilder::default();
+
+        let (tx, rx) = mpsc::channel(1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let source_name = source_name.unwrap_or_else(|| format!("in-{id}"));
+        let transform_name = transform_name.unwrap_or_else(|| format!("transform-{id}"));
+        let sink_name = sink_name.unwrap_or_else(|| format!("out-{id}"));
+
+        builder.add_source(source_name.clone(), UnitTestStreamSourceConfig::new(events));
+        builder.add_transform(transform_name.clone(), &[source_name.as_str()], transform_config);
+        builder.add_sink(
+            sink_name.clone(),
+            &[transform_name.as_str()],
+            UnitTestStreamSinkConfig::new(
+                PollSender::new(tx).sink_map_err(|error| panic!("{}", error)),
+            ),
+        );
+
+        let config = builder.build().expect("building config should not fail");
+        let (topology, _) = start_topology(config, false).await;
+
+        (topology, rx, source_name, transform_name, sink_name)
+    }
 
     #[tokio::test]
     async fn reduce_from_condition() {
@@ -406,31 +448,36 @@ group_by = [ "request_id" ]
                 .schema_definitions(true)
                 .clone();
 
-            let new_schema_definition = reduce_config.outputs(
-                &Default::default(),
-                &[(OutputId::from("in"), Definition::default_legacy_namespace())],
-            )[0]
-            .clone()
-            .log_schema_definitions
-            .get(&OutputId::from("in"))
-            .unwrap()
-            .clone();
-
             let (tx, rx) = mpsc::channel(1);
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+            let (topology, mut out, source_name, transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), reduce_config, None, None, None).await;
+
+            let new_schema_definition = reduce_config
+                .outputs(
+                    &Default::default(),
+                    &[(
+                        OutputId::from(source_name.clone()),
+                        Definition::default_legacy_namespace(),
+                    )],
+                )[0]
+                .clone()
+                .log_schema_definitions
+                .get(&OutputId::from(source_name.clone()))
+                .unwrap()
+                .clone();
 
             let mut e_1 = LogEvent::from("test message 1");
             e_1.insert("counter", 1);
             e_1.insert("request_id", "1");
             let mut metadata_1 = e_1.metadata().clone();
-            metadata_1.set_upstream_id(Arc::new(OutputId::from("transform")));
+            metadata_1.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
             metadata_1.set_schema_definition(&Arc::new(new_schema_definition.clone()));
 
             let mut e_2 = LogEvent::from("test message 2");
             e_2.insert("counter", 2);
             e_2.insert("request_id", "2");
             let mut metadata_2 = e_2.metadata().clone();
-            metadata_2.set_upstream_id(Arc::new(OutputId::from("transform")));
+            metadata_2.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
             metadata_2.set_schema_definition(&Arc::new(new_schema_definition.clone()));
 
             let mut e_3 = LogEvent::from("test message 3");
@@ -496,17 +543,22 @@ merge_strategies.baz = "max"
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
 
-            let new_schema_definition = reduce_config.outputs(
-                &Default::default(),
-                &[(OutputId::from("in"), Definition::default_legacy_namespace())],
-            )[0]
-            .clone()
-            .log_schema_definitions
-            .get(&OutputId::from("in"))
-            .unwrap()
-            .clone();
+            let (topology, mut out, source_name, transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), reduce_config, None, None, None).await;
 
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+            let new_schema_definition = reduce_config
+                .outputs(
+                    &Default::default(),
+                    &[(
+                        OutputId::from(source_name.clone()),
+                        Definition::default_legacy_namespace(),
+                    )],
+                )[0]
+                .clone()
+                .log_schema_definitions
+                .get(&OutputId::from(source_name.clone()))
+                .unwrap()
+                .clone();
 
             let mut e_1 = LogEvent::from("test message 1");
             e_1.insert("foo", "first foo");
@@ -514,7 +566,7 @@ merge_strategies.baz = "max"
             e_1.insert("baz", 2);
             e_1.insert("request_id", "1");
             let mut metadata = e_1.metadata().clone();
-            metadata.set_upstream_id(Arc::new(OutputId::from("transform")));
+            metadata.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
             metadata.set_schema_definition(&Arc::new(new_schema_definition.clone()));
             tx.send(e_1.into()).await.unwrap();
 
@@ -565,31 +617,37 @@ group_by = [ "request_id" ]
 
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
-            let new_schema_definition = reduce_config.outputs(
-                &Default::default(),
-                &[(OutputId::from("in"), Definition::default_legacy_namespace())],
-            )[0]
-            .clone()
-            .log_schema_definitions
-            .get(&OutputId::from("in"))
-            .unwrap()
-            .clone();
 
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+            let (topology, mut out, source_name, transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), reduce_config, None, None, None).await;
+
+            let new_schema_definition = reduce_config
+                .outputs(
+                    &Default::default(),
+                    &[(
+                        OutputId::from(source_name.clone()),
+                        Definition::default_legacy_namespace(),
+                    )],
+                )[0]
+                .clone()
+                .log_schema_definitions
+                .get(&OutputId::from(source_name.clone()))
+                .unwrap()
+                .clone();
 
             let mut e_1 = LogEvent::from("test message 1");
             e_1.insert("counter", 1);
             e_1.insert("request_id", "1");
             let mut metadata_1 = e_1.metadata().clone();
-            metadata_1.set_upstream_id(Arc::new(OutputId::from("transform")));
+            metadata_1.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
             metadata_1.set_schema_definition(&Arc::new(new_schema_definition.clone()));
             tx.send(e_1.into()).await.unwrap();
 
             let mut e_2 = LogEvent::from("test message 2");
             e_2.insert("counter", 2);
             let mut metadata_2 = e_2.metadata().clone();
-            metadata_2.set_upstream_id(Arc::new(OutputId::from("transform")));
-            metadata_2.set_schema_definition(&Arc::new(new_schema_definition));
+            metadata_2.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
+            metadata_2.set_schema_definition(&Arc::new(new_schema_definition.clone()));
             tx.send(e_2.into()).await.unwrap();
 
             let mut e_3 = LogEvent::from("test message 3");
@@ -660,7 +718,8 @@ max_events = 1
         .unwrap();
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+            let (topology, mut out, _source_name, _transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), reduce_config, None, None, None).await;
 
             let mut e_1 = LogEvent::from("test 1");
             e_1.insert("id", "1");
@@ -704,7 +763,8 @@ max_events = 3
 
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+            let (topology, mut out, _source_name, _transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), reduce_config, None, None, None).await;
 
             let mut e_1 = LogEvent::from("test 1");
             e_1.insert("id", "1");
@@ -773,24 +833,29 @@ merge_strategies.bar = "concat"
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
 
-            let new_schema_definition = reduce_config.outputs(
-                &Default::default(),
-                &[(OutputId::from("in"), Definition::default_legacy_namespace())],
-            )[0]
-            .clone()
-            .log_schema_definitions
-            .get(&OutputId::from("in"))
-            .unwrap()
-            .clone();
+            let (topology, mut out, source_name, transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), reduce_config, None, None, None).await;
 
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+            let new_schema_definition = reduce_config
+                .outputs(
+                    &Default::default(),
+                    &[(
+                        OutputId::from(source_name.clone()),
+                        Definition::default_legacy_namespace(),
+                    )],
+                )[0]
+                .clone()
+                .log_schema_definitions
+                .get(&OutputId::from(source_name.clone()))
+                .unwrap()
+                .clone();
 
             let mut e_1 = LogEvent::from("test message 1");
             e_1.insert("foo", json!([1, 3]));
             e_1.insert("bar", json!([1, 3]));
             e_1.insert("request_id", "1");
             let mut metadata_1 = e_1.metadata().clone();
-            metadata_1.set_upstream_id(Arc::new(OutputId::from("transform")));
+            metadata_1.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
             metadata_1.set_schema_definition(&Arc::new(new_schema_definition.clone()));
 
             tx.send(e_1.into()).await.unwrap();
@@ -800,8 +865,8 @@ merge_strategies.bar = "concat"
             e_2.insert("bar", json!([2, 4]));
             e_2.insert("request_id", "2");
             let mut metadata_2 = e_2.metadata().clone();
-            metadata_2.set_upstream_id(Arc::new(OutputId::from("transform")));
-            metadata_2.set_schema_definition(&Arc::new(new_schema_definition));
+            metadata_2.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
+            metadata_2.set_schema_definition(&Arc::new(new_schema_definition.clone()));
             tx.send(e_2.into()).await.unwrap();
 
             let mut e_3 = LogEvent::from("test message 3");
@@ -866,7 +931,8 @@ merge_strategies.bar = "concat"
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
 
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), reduce_config).await;
+            let (topology, mut out, _source_name, transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), reduce_config, None, None, None).await;
 
             let e_1 = LogEvent::from(Value::from(btreemap! {
                 "id" => 777,
@@ -879,7 +945,7 @@ merge_strategies.bar = "concat"
                 "arr" => vec![btreemap! { "a" => 1 }, btreemap! { "b" => 1 }]
             }));
             let mut metadata_1 = e_1.metadata().clone();
-            metadata_1.set_upstream_id(Arc::new(OutputId::from("reduce")));
+            metadata_1.set_upstream_id(Arc::new(OutputId::from(transform_name.clone())));
 
             tx.send(e_1.into()).await.unwrap();
 
@@ -967,7 +1033,8 @@ merge_strategies.bar = "concat"
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
 
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), config).await;
+            let (topology, mut out, _source_name, _transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), config, None, None, None).await;
 
             let v_1 = Value::from(btreemap! {
                 "attrs" => btreemap! {
@@ -1026,7 +1093,8 @@ merge_strategies.bar = "concat"
         assert_transform_compliance(async move {
             let (tx, rx) = mpsc::channel(1);
 
-            let (topology, mut out) = create_topology(ReceiverStream::new(rx), config).await;
+            let (topology, mut out, _source_name, _transform_name, _sink_name) =
+                create_topology(ReceiverStream::new(rx), config, None, None, None).await;
 
             let e_1 = LogEvent::from(Value::from(btreemap! {"a b" => 1}));
             tx.send(e_1.into()).await.unwrap();
